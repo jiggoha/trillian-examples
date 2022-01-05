@@ -1,3 +1,17 @@
+// Copyright 2021 Google LLC. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package storage provides a log storage implementation on Google Cloud Storage (GCS).
 package storage
 
@@ -14,6 +28,8 @@ import (
 	"github.com/google/trillian-examples/serverless/api/layout"
 	"google.golang.org/api/iterator"
 )
+
+const leavesPendingPathFmt = "leaves/pending/%0x"
 
 // Client is a serverless storage implementation which uses a GCS bucket to store tree state.
 // The naming of the objects of the GCS object is:
@@ -168,6 +184,83 @@ func (c *Client) ScanSequenced(ctx context.Context, begin uint64, f func(seq uin
 	}
 }
 
+// Sequence assigns the given leaf entry to the next available sequence number.
+// This method will attempt to silently squash duplicate leaves, but it cannot
+// be guaranteed that no duplicate entries will exist.
+// Returns the sequence number assigned to this leaf (if the leaf has already
+// been sequenced it will return the original sequence number and
+// storage.ErrDupeLeaf).
+func (c *Client) Sequence(leafhash []byte, leaf []byte) (uint64, error) {
+	// 1. Check for dupe leafhash
+	// 2. Write temp file
+	// 3. Hard link temp -> seq file
+	// 4. Create leafhash file containing assigned sequence number
+
+	// Check for dupe leaf already present.
+	// If there is one, it should contain the existing leaf's sequence number,
+	// so read that back and return it.
+	leafFQ := filepath.Join(layout.LeafPath("", leafhash))
+
+	bkt := c.gcsClient.Bucket(c.bucket)
+	r, err := bkt.Object(leafFQ).NewReader(ctx)
+	if err != nil {
+		return err
+	}
+	defer r.close()
+
+	seqString, err := ioutil.ReadAll(r)
+	if err != gcs.ErrObjectNotExist {
+		origSeq, err := strconv.ParseUint(string(seqString), 16, 64)
+		if err != nil {
+			return 0, err
+		}
+		return origSeq, storage.ErrDupeLeaf
+	}
+
+	// Write a temp file with the leaf data
+	tmpPath := fmt.Sprintf(leavesPendingPathFmt, leafhash)
+	if err := createExclusive(tmpPath, leaf); err != nil {
+		return 0, fmt.Errorf("unable to write temporary file: %w", err)
+	}
+	defer func() {
+		os.Remove(tmpPath)
+	}()
+
+	// Now try to sequence it, we may have to scan over some newly sequenced entries
+	// if Sequence has been called since the last time an Integrate/WriteCheckpoint
+	// was called.
+	for {
+		seq := c.nextSeq
+
+		// Write the sequence file
+		seqPath := filepath.Join(layout.SeqPath("", seq))
+
+		bkt := c.gcsClient.Bucket(c.bucket)
+		wSeq := bkt.Object(seqPath).NewWriter(ctx)
+
+		if err := wSeq.Write(seqPath, leaf); errors.Is(err, os.ErrExist) {
+			// That sequence number is in use, try the next one
+			c.nextSeq++
+			continue
+		} else if err != nil {
+			return 0, fmt.Errorf("failed to write seq file: %w", err)
+		}
+
+		// Create a leafhash file containing the assigned sequence number.
+		// This isn't infallible though, if we crash after hardlinking the
+		// sequence file above, but before doing this a resubmission of the
+		// same leafhash would be permitted.
+		leafPath := fmt.Sprintf("%s.tmp", leafFQ)
+		wLeaf := bkt.Object(leafPath).NewWriter(ctx)
+		if err := wLeaf.Write(leafPath, []byte(strconv.FormatUint(seq, 16))); err != nil {
+			return 0, fmt.Errorf("couldn't create leafhash object: %w", err)
+		}
+
+		// All done!
+		return seq, nil
+	}
+}
+
 // StoreTile writes a tile out to disk.
 // Fully populated tiles are stored at the path corresponding to the level &
 // index parameters, partially populated (i.e. right-hand edge) tiles are
@@ -212,7 +305,6 @@ func (c *Client) StoreTile(ctx context.Context, level, index uint64, tile *api.T
 			if err != nil {
 				return fmt.Errorf("failed to get object '%s' from bucket '%s': %v", tPath, c.bucket, err)
 			}
-
 
 			if _, err := bkt.Object(attrs.Name).NewWriter(ctx).Write(t); err != nil {
 				return fmt.Errorf("failed to copy full tile to partials object '%s' in bucket '%s': %v", attrs.Name, c.bucket, err)
