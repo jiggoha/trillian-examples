@@ -39,9 +39,9 @@ import (
 	"github.com/google/trillian-examples/serverless/api"
 	"github.com/google/trillian-examples/serverless/api/layout"
 	"github.com/google/trillian-examples/serverless/client"
-	"github.com/google/trillian-examples/serverless/internal/log"
 	"github.com/google/trillian-examples/serverless/internal/storage"
 	"github.com/google/trillian-examples/serverless/internal/storage/webstorage"
+	"github.com/google/trillian-examples/serverless/pkg/log"
 	"github.com/transparency-dev/merkle/compact"
 	"github.com/transparency-dev/merkle/rfc6962"
 	"golang.org/x/mod/sumdb/note"
@@ -126,7 +126,8 @@ func integrate() js.Func {
 			}
 		}
 
-		newCp, err := log.Integrate(context.Background(), *cp, logStorage, rfc6962.DefaultHasher)
+		ctx := context.Background()
+		newCp, err := log.Integrate(ctx, *cp, logStorage, rfc6962.DefaultHasher)
 		if err != nil {
 			logMsg(fmt.Sprintf("Failed to integrate: %q", err))
 			panic(err)
@@ -146,7 +147,7 @@ func integrate() js.Func {
 			logMsg(err.Error())
 			return nil
 		}
-		if err := logStorage.WriteCheckpoint(nRaw); err != nil {
+		if err := logStorage.WriteCheckpoint(ctx, nRaw); err != nil {
 			logMsg(err.Error())
 			return nil
 		}
@@ -176,7 +177,7 @@ func sequence() js.Func {
 			}
 			h := rfc6962.DefaultHasher.HashLeaf(l)
 			isDupe := false
-			seq, err := logStorage.Sequence(h, l)
+			seq, err := logStorage.Sequence(context.Background(), h, l)
 			if err != nil {
 				if !errors.Is(err, storage.ErrDupeLeaf) {
 					logMsg(err.Error())
